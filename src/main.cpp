@@ -277,7 +277,7 @@ namespace
 	}
 }
 
-SKSEPlugin_Load(const SKSE::LoadInterface* a_skse)
+SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
 	logger::info("DragonBloodAudio 载入 (Skyrim {})", REL::Module::get().version().string());
