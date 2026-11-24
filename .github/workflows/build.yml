@@ -1,58 +1,128 @@
 name: build
 
-# 只在手动触发时运行：Actions 页 → build → Run workflow
+# 只在 Actions 页面手动点 "Run workflow" 时运行：提交代码不会自动打包
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # SkyrimYacht 上验证过的同一套组合
+  VCPKG_COMMIT: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+  # alandtse/CommonLibSSE-NG 的 ng 分支（含 GetSoundHandleByFile），固定提交避免漂移
+  CLIB_COMMIT: 7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a
+  VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
+  VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+
 jobs:
   windows:
-    runs-on: windows-latest
-    env:
-      VCPKG_ROOT: C:\vcpkg
+    runs-on: windows-2022
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: 长路径支持
+      - name: 取回 CommonLibSSE-NG 源码
         shell: pwsh
-        run: git config --global core.longpaths true
+        run: |
+          git clone --recursive https://github.com/alandtse/CommonLibSSE-NG extern/CommonLibSSE-NG
+          if ($LASTEXITCODE -ne 0) { throw "CommonLibSSE-NG clone 失败" }
+          git -C extern/CommonLibSSE-NG checkout $env:CLIB_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw "checkout $env:CLIB_COMMIT 失败" }
+          Write-Host "CommonLibSSE-NG @ $env:CLIB_COMMIT"
 
-      - name: 缓存 vcpkg 已装依赖
+      - name: Cache vcpkg 二进制缓存
         uses: actions/cache@v4
         with:
-          path: C:\vcpkg\installed
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          path: vcpkg-bincache
+          key: vcpkg-cache-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-cache-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-
 
-      - name: 准备 vcpkg 与 CommonLibSSE-NG 端口
+      - name: Cache vcpkg 已装依赖
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed
+          key: vcpkg-inst-${{ runner.os }}-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-inst-${{ runner.os }}-x64-windows-static-md-
+
+      - name: 准备 vcpkg
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git C:\vcpkg
+          New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+          git clone https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
           if ($LASTEXITCODE -ne 0) { throw "vcpkg clone 失败" }
-          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-          if ($LASTEXITCODE -ne 0) { throw "bootstrap 失败" }
-          C:\vcpkg\vcpkg.exe --version
-          git clone --depth 1 https://gitlab.com/colorglass/vcpkg-colorglass.git C:\clports
-          if ($LASTEXITCODE -ne 0) { throw "colorglass 端口仓库 clone 失败" }
-          Get-ChildItem C:\clports\ports\commonlibsse-ng -ErrorAction SilentlyContinue
+          git -C "$env:VCPKG_ROOT" checkout $env:VCPKG_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg checkout 失败" }
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap 失败" }
+          & "$env:VCPKG_ROOT/vcpkg.exe" version
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg 无法运行" }
 
       - name: Configure
+        id: configure
+        continue-on-error: true
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
-            -DVCPKG_OVERLAY_PORTS=C:/clports/ports
-          if ($LASTEXITCODE -ne 0) { throw "configure 失败" }
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $common = @(
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake",
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static-md",
+            "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+          )
+          $generators = @("Visual Studio 17 2022")
+          $help = (cmake --help) -join "`n"
+          $generators += [regex]::Matches($help, 'Visual Studio [0-9]+ [0-9]{4}') | ForEach-Object { $_.Value }
+          $ok = $false
+          foreach ($g in $generators) {
+            Write-Host "尝试生成器: $g"
+            cmake -S . -B build -G $g -A x64 @common 2>&1 | Tee-Object -FilePath logs/configure.txt
+            if ($LASTEXITCODE -eq 0) { Write-Host "生成成功: $g"; $ok = $true; break }
+            Remove-Item -LiteralPath build -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $ok) {
+            Select-String -Path logs/configure.txt -Pattern 'error|Error|CMake Error' | Select-Object -First 40 |
+              ForEach-Object { Write-Output "::error::$($_.Line.Trim())" }
+            exit 1
+          }
 
       - name: Build
+        id: build
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
         shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
-          if ($LASTEXITCODE -ne 0) { throw "build 失败" }
+          cmake --build build --config Release --parallel -- /p:CL_MPCount=4 /nologo /v:minimal 2>&1 | Tee-Object -FilePath logs/build.txt
+          $code = $LASTEXITCODE
+          Select-String -Path logs/build.txt -Pattern ': (fatal )?error ' | Select-Object -First 40 |
+            ForEach-Object { Write-Output "::error::$($_.Line.Trim())" }
+          if ($code -ne 0) { exit 1 }
 
-      - uses: actions/upload-artifact@v4
+      - name: 汇总失败原因
+        if: steps.configure.outcome != 'success' || steps.build.outcome != 'success'
+        shell: pwsh
+        run: |
+          Get-ChildItem logs -ErrorAction SilentlyContinue | ForEach-Object { "---- $($_.Name)"; Get-Content $_.FullName -Tail 60 }
+          exit 1
+
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: logs/
+          if-no-files-found: warn
+
+      - name: 上传 DLL
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
         with:
           name: DragonBlood
           path: build/Release/DragonBlood.dll
+          if-no-files-found: error
