@@ -1,38 +1,53 @@
-// DragonBlood.dll — 龙血棋的音频插件（只做音频）
+// DragonBlood.dll — 音频 + 把页面的 JS 通道补到 Papyrus（脚本 0 改动）
 //
-// 为什么必须有它：Magelight 的页面（Ultralight）没有媒体栈，放不了任何声音；
-// Papyrus 也没有按文件播放、改「Music」类别音量的接口。
+// 为什么必须有它：
+//   1. Magelight 的页面（Ultralight）没有媒体栈，放不了声音，Papyrus 也没有按文件播放、
+//      改「Music」类别音量的接口 —— 所以音频必须在 DLL 里实现。
+//   2. v28 的 TIF__02000804.psc 在 CreateView 之后立刻调 Magelight.RegisterListener，
+//      那一刻视图还没就绪（IsViewValid=false），8 个监听全部注册失败，于是页面发出的
+//      sfx / bgm / duelLeave 全被宿主当成未注册通道丢弃 —— 声音不响、离开牌桌没反应
+//      都是这一条。DLL 可以事后补注册（RegisterJSListenerEx 没有归属校验），
+//      并在回调里按 Magelight 自己的做法转发成 Magelight_JS_<name> mod event，
+//      交回脚本里现成的 OnSfx / OnBgm / OnDuelLeave，逻辑一行都不用复制。
 //
-// 对外只实现 DragonBloodAudio.psc 里的 7 个原生函数，签名与 v28 的 pex 完全一致：
-//   Int Play(String name, Float vol, Bool loop)
-//   Stop(Int id) / StopAll() / Tick() / MusicMute(Bool) / IsReady() / DiagCategories()
-// 脚本自己决定何时开 BGM、何时静音本体音乐；插件不碰界面、不碰视图、不碰 UI 模式。
-//
-// 关键点（照 Skygwent 的做法，同一套引擎）：
-//   · Music 类别 = BGSDefaultObjectManager 的 kMusicSoundCategory
-//   · GetSoundHandleByFile 之后必须 IsValid()，否则就是静默失败
-//   · 路径 Sound\ / Data\Sound\ / sound\ 三种根，成功一次就记住
+// 视图归属（读 Magelight 源码与官方头文件确认，不是推测）：
+//   · 视图是可寻址的：头文件原话 "Any consumer that knows a ViewId can act on it —
+//     ShowView/Navigate/DestroyView/EvalJS and listener registration — including ids owned by another mod"
+//   · ViewId 不需要脚本给：GetUIModeOwner() 返回持有 UI 模式的 mod（就是 DragonBlood），
+//     FindView(mod,"board") 按名字查表即可（FindViewByName 只查表，无归属判断）
+//   · Magelight.dll 比本插件后加载，API 不能在加载阶段取，必须运行中惰性查找
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 
+#include "MagelightUI_API.h"
+
+// windows.h 由上面的头带进来，会把 GetObject 变成 GetObjectA 这类宏
+#undef GetObject
+#undef GetObjectA
+#undef GetObjectW
+
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace logger = SKSE::log;
+namespace ml = MAGELIGHT_API;
 
 namespace
 {
 	constexpr std::uint32_t kSoundFlags = 0x1A;
 	constexpr std::uint32_t kSoundPriority = 128;
 	constexpr std::uint32_t kLoopLeadMs = 460;
+	constexpr std::uint32_t kTickMs = 250;
+
+	// ---------------- 音频 ----------------
 
 	struct Entry
 	{
@@ -44,7 +59,7 @@ namespace
 		std::chrono::steady_clock::time_point started;
 	};
 
-	std::mutex           g_lock;
+	std::mutex           g_audioLock;
 	std::map<int, Entry> g_playing;
 	int                  g_nextId{ 1 };
 
@@ -52,7 +67,22 @@ namespace
 	float                 g_savedMusicVolume{ 1.0f };
 	bool                  g_musicMuted{ false };
 	std::string           g_soundRoot;
-	std::atomic<bool>     g_ticking{ false };
+
+	// ---------------- 页面通道 ----------------
+
+	const ml::MagelightApi4* g_api{ nullptr };
+	std::atomic<ml::ViewId>  g_view{ 0 };
+
+	struct JsCall
+	{
+		std::string name;
+		std::string arg;
+	};
+
+	std::mutex           g_callLock;
+	std::vector<JsCall>  g_calls;
+
+	std::atomic<bool> g_workerUp{ false };
 
 	bool TryPlay(const std::string& a_path, float a_volume, RE::BSSoundHandle& a_out)
 	{
@@ -132,7 +162,7 @@ namespace
 		return cat;
 	}
 
-	void MusicMute(bool a_mute)
+	void MusicMuteImpl(bool a_mute)
 	{
 		auto* cat = GetMusicCategory();
 		if (!cat) {
@@ -162,7 +192,7 @@ namespace
 			name += ".wav";
 		}
 
-		std::lock_guard lock(g_lock);
+		std::lock_guard lock(g_audioLock);
 		int id = g_nextId++;
 
 		Entry entry;
@@ -178,7 +208,7 @@ namespace
 
 	void StopClip(int a_id)
 	{
-		std::lock_guard lock(g_lock);
+		std::lock_guard lock(g_audioLock);
 		auto it = g_playing.find(a_id);
 		if (it == g_playing.end()) {
 			return;
@@ -191,7 +221,7 @@ namespace
 
 	void StopAllClips()
 	{
-		std::lock_guard lock(g_lock);
+		std::lock_guard lock(g_audioLock);
 		for (auto& pair : g_playing) {
 			if (pair.second.handle.IsValid()) {
 				pair.second.handle.FadeOutAndRelease(150);
@@ -202,7 +232,7 @@ namespace
 
 	void TickOnce()
 	{
-		std::lock_guard lock(g_lock);
+		std::lock_guard lock(g_audioLock);
 		const auto now = std::chrono::steady_clock::now();
 		for (auto it = g_playing.begin(); it != g_playing.end();) {
 			Entry& entry = it->second;
@@ -240,62 +270,160 @@ namespace
 		}
 	}
 
-	void StartTicking()
+	// ---------------- 页面 → Papyrus 桥 ----------------
+
+	// 渲染线程：只把名字和参数抄进队列，绝不碰 RE 状态、不调 SKSE AddTask
+	void OnJsCall(ml::ViewId, const char* a_arg, void* a_user)
+	{
+		if (!a_user) {
+			return;
+		}
+		const std::string* name = static_cast<const std::string*>(a_user);
+		std::lock_guard lock(g_callLock);
+		JsCall call;
+		call.name = *name;
+		call.arg = a_arg ? a_arg : "";
+		g_calls.push_back(std::move(call));
+	}
+
+	void AttachViewIfPossible()
+	{
+		if (!g_api) {
+			g_api = ml::RequestApi4();
+			if (!g_api) {
+				return;
+			}
+			logger::info("Magelight UI API v4 已取到（host {}）", g_api->hostVersion ? g_api->hostVersion : "?");
+		}
+
+		const ml::ModId owner = g_api->GetUIModeOwner();
+		if (!owner) {
+			return;
+		}
+
+		ml::ViewId view = 0;
+		if (g_api->FindView(owner, "board", &view) != ml::Result::Ok || !view) {
+			return;
+		}
+		if (view == g_view.load()) {
+			return;
+		}
+
+		// 每个名字一份永久的 std::string，作为回调的 user（跟 Magelight 自己的 NameHandle 同思路）
+		static std::string s_names[8];
+		static const char* const kChannels[8] = {
+			"ready", "duelWin", "duelLose", "duelDraw", "duelLeave", "sfx", "bgm", "bgmStop"
+		};
+
+		g_view.store(view);
+		int ok = 0;
+		for (int i = 0; i < 8; ++i) {
+			s_names[i] = kChannels[i];
+			if (g_api->RegisterJSListenerEx(view, kChannels[i], OnJsCall, &s_names[i]) == ml::Result::Ok) {
+				++ok;
+			}
+		}
+		logger::info("视图已接管 view={}，JS 通道注册 {}/8", view, ok);
+
+		// 页面的 'ready' 通常在 UI 模式进入之前就发了，那时通道还不存在，会被宿主丢；
+		// 这里补发一次，让脚本的 OnReady -> PushInfo 把对手名、金币推回页面。
+		if (ok > 0) {
+			std::lock_guard lock(g_callLock);
+			JsCall ready;
+			ready.name = "ready";
+			g_calls.push_back(std::move(ready));
+		}
+	}
+
+	void DrainCalls()
+	{
+		std::vector<JsCall> local;
+		{
+			std::lock_guard lock(g_callLock);
+			if (g_calls.empty()) {
+				return;
+			}
+			local.swap(g_calls);
+		}
+
+		auto* source = SKSE::GetModCallbackEventSource();
+		if (!source) {
+			logger::warn("ModCallbackEvent 源拿不到，页面事件无法转发给脚本");
+			return;
+		}
+
+		const float numArg = static_cast<float>(g_view.load());
+		for (const JsCall& call : local) {
+			RE::BSFixedString eventName(("Magelight_JS_" + call.name).c_str());
+			RE::BSFixedString strArg(call.arg.c_str());
+			SKSE::ModCallbackEvent ev{ eventName, strArg, numArg, nullptr };
+			source->SendEvent(&ev);
+		}
+	}
+
+	// 游戏线程
+	void Pump()
+	{
+		AttachViewIfPossible();
+		DrainCalls();
+		TickOnce();
+	}
+
+	void StartWorker()
 	{
 		bool expected = false;
-		if (!g_ticking.compare_exchange_strong(expected, true)) {
+		if (!g_workerUp.compare_exchange_strong(expected, true)) {
 			return;
 		}
 		std::thread([]() {
-			while (g_ticking.load()) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			while (g_workerUp.load()) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(kTickMs));
 				auto* tasks = SKSE::GetTaskInterface();
 				if (!tasks) {
 					break;
 				}
 				tasks->AddTask([]() {
-					if (g_ticking.load()) {
-						TickOnce();
+					if (g_workerUp.load()) {
+						Pump();
 					}
 				});
 			}
 		}).detach();
 	}
 
-	// ---------- Papyrus 原生函数 ----------
+	// ---------------- Papyrus 原生函数 ----------------
 
-	int Play(RE::StaticFunctionTag*, std::string a_name, float a_volume, bool a_loop)
+	int PapPlay(RE::StaticFunctionTag*, std::string a_name, float a_volume, bool a_loop)
 	{
-		StartTicking();
 		return PlayClip(a_name, a_volume, a_loop);
 	}
 
-	void Stop(RE::StaticFunctionTag*, int a_id)
+	void PapStop(RE::StaticFunctionTag*, int a_id)
 	{
 		StopClip(a_id);
 	}
 
-	void StopAll(RE::StaticFunctionTag*)
+	void PapStopAll(RE::StaticFunctionTag*)
 	{
 		StopAllClips();
 	}
 
-	void Tick(RE::StaticFunctionTag*)
+	void PapTick(RE::StaticFunctionTag*)
 	{
 		TickOnce();
 	}
 
-	void MusicMute(RE::StaticFunctionTag*, bool a_mute)
+	void PapMusicMute(RE::StaticFunctionTag*, bool a_mute)
 	{
-		MusicMute(a_mute);
+		MusicMuteImpl(a_mute);
 	}
 
-	bool IsReady(RE::StaticFunctionTag*)
+	bool PapIsReady(RE::StaticFunctionTag*)
 	{
 		return RE::BSAudioManager::GetSingleton() != nullptr;
 	}
 
-	std::string DiagCategories(RE::StaticFunctionTag*)
+	std::string PapDiagCategories(RE::StaticFunctionTag*)
 	{
 		auto* cat = GetMusicCategory();
 		if (!cat) {
@@ -311,13 +439,13 @@ namespace
 
 	bool RegisterFunctions(RE::BSScript::IVirtualMachine* a_vm)
 	{
-		a_vm->RegisterFunction("Play", "DragonBloodAudio", Play);
-		a_vm->RegisterFunction("Stop", "DragonBloodAudio", Stop);
-		a_vm->RegisterFunction("StopAll", "DragonBloodAudio", StopAll);
-		a_vm->RegisterFunction("Tick", "DragonBloodAudio", Tick);
-		a_vm->RegisterFunction("MusicMute", "DragonBloodAudio", MusicMute);
-		a_vm->RegisterFunction("IsReady", "DragonBloodAudio", IsReady);
-		a_vm->RegisterFunction("DiagCategories", "DragonBloodAudio", DiagCategories);
+		a_vm->RegisterFunction("Play", "DragonBloodAudio", PapPlay);
+		a_vm->RegisterFunction("Stop", "DragonBloodAudio", PapStop);
+		a_vm->RegisterFunction("StopAll", "DragonBloodAudio", PapStopAll);
+		a_vm->RegisterFunction("Tick", "DragonBloodAudio", PapTick);
+		a_vm->RegisterFunction("MusicMute", "DragonBloodAudio", PapMusicMute);
+		a_vm->RegisterFunction("IsReady", "DragonBloodAudio", PapIsReady);
+		a_vm->RegisterFunction("DiagCategories", "DragonBloodAudio", PapDiagCategories);
 		logger::info("DragonBloodAudio: 7 个 Papyrus 函数已注册");
 		return true;
 	}
@@ -326,12 +454,15 @@ namespace
 SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
-	logger::info("DragonBloodAudio 载入");
 
 	auto* papyrus = SKSE::GetPapyrusInterface();
-	if (!papyrus || !papyrus->Register(RegisterFunctions)) {
-		logger::error("DragonBloodAudio: Papyrus 注册失败");
-		return false;
+	if (papyrus && papyrus->Register(RegisterFunctions)) {
+		logger::info("DragonBlood 载入：Papyrus 函数已注册（音频可用）");
+	} else {
+		logger::error("DragonBlood 载入：Papyrus 注册失败，音频不可用");
 	}
+
+	StartWorker();
+	logger::info("DragonBlood 载入：后台线程已启动（视图通道与音频循环异步接管）");
 	return true;
 }
