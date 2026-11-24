@@ -1,36 +1,58 @@
 name: build
 
+# 只在手动触发时运行：Actions 页 → build → Run workflow
 on:
-  push:
   workflow_dispatch:
 
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      VCPKG_ROOT: C:\vcpkg
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: vcpkg 与 CommonLibSSE-NG 端口
+      - name: 长路径支持
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - name: 缓存 vcpkg 已装依赖
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+
+      - name: 准备 vcpkg 与 CommonLibSSE-NG 端口
         shell: pwsh
         run: |
-          # 不能浅克隆：vcpkg.json 里的 builtin-baseline 需要完整历史
-          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          $ErrorActionPreference = 'Stop'
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git C:\vcpkg
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg clone 失败" }
           C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap 失败" }
+          C:\vcpkg\vcpkg.exe --version
           git clone --depth 1 https://gitlab.com/colorglass/vcpkg-colorglass.git C:\clports
+          if ($LASTEXITCODE -ne 0) { throw "colorglass 端口仓库 clone 失败" }
+          Get-ChildItem C:\clports\ports\commonlibsse-ng -ErrorAction SilentlyContinue
 
       - name: Configure
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             -DVCPKG_OVERLAY_PORTS=C:/clports/ports
+          if ($LASTEXITCODE -ne 0) { throw "configure 失败" }
 
       - name: Build
         shell: pwsh
-        run: cmake --build build --config Release --parallel
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "build 失败" }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: DragonBloodAudio
-          path: build/Release/DragonBloodAudio.dll
+          name: DragonBlood
+          path: build/Release/DragonBlood.dll
