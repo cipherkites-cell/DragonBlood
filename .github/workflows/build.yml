@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: vcpkg 与 CommonLibSSE-NG 端口
+        shell: pwsh
+        run: |
+          # 不能浅克隆：vcpkg.json 里的 builtin-baseline 需要完整历史
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          git clone --depth 1 https://gitlab.com/colorglass/vcpkg-colorglass.git C:\clports
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DVCPKG_OVERLAY_PORTS=C:/clports/ports
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DragonBloodAudio
+          path: build/Release/DragonBloodAudio.dll
