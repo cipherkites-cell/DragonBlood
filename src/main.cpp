@@ -13,6 +13,11 @@
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 
+#include <cctype>
+#include <cstdint>
+
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -105,7 +110,7 @@ namespace
 			const std::string nameLow = LowerCopy(name);
 
 			// 先看名字/EDID 里带 music 的；国/俄/欧版没有英文 EDID 时靠名字兜底
-			if (Contains(nameLow, "music") || Contains(nameLow, u8"音乐") || Contains(nameLow, u8"音樂") ||
+			if (Contains(nameLow, "music") || Contains(nameLow, "音乐") || Contains(nameLow, "音樂") ||
 				Contains(editorLow, "music")) {
 				best = form;
 				if (Contains(editorLow, "music") && Contains(nameLow, "music")) {
