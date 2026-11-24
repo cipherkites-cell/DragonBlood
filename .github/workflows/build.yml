@@ -16,6 +16,8 @@ env:
   VCPKG_COMMIT: 9e593bb18ea69cc5095e012465dcd675a822ed0d
   # alandtse/CommonLibSSE-NG 的 ng 分支（含 GetSoundHandleByFile），固定提交避免漂移
   CLIB_COMMIT: 7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a
+  # MagelightUI_API.h 的来源（固定提交，避免头文件漂移）
+  MAGELIGHT_COMMIT: 0cbe86afc68155e6fddc964e38e0f6faf08c3427
   VCPKG_ROOT: ${{ github.workspace }}\vcpkg
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
   VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
@@ -27,6 +29,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: 取回 MagelightUI_API.h（Magelight 的公开头文件，不放进仓库）
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Severause/MagelightUI/$env:MAGELIGHT_COMMIT/api/MagelightUI_API.h" -OutFile "src\MagelightUI_API.h"
+          if (-not (Test-Path "src\MagelightUI_API.h")) { throw "MagelightUI_API.h 下载失败" }
 
       - name: 取回 CommonLibSSE-NG 源码
         shell: pwsh
