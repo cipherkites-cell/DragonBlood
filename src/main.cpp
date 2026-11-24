@@ -17,6 +17,12 @@
 // 不依赖任何 Papyrus 原生函数，也不依赖脚本增加调用：
 // 脚本仍旧是 v6 那份（对话选项正常），插件在 DomReady / UIModeEntered 时自己接管。
 
+#include <RE/Skyrim.h>
+#include <SKSE/SKSE.h>
+
+// Magelight 的公开头文件会带进 <Windows.h>：必须排在 CommonLib 之后
+// （REX/W32/BASE.h 检查这个顺序）。它同时把 GetObject 定义成 GetObjectA/W，
+// 会盖掉 RE::BGSDefaultObjectManager::GetObject，所以紧跟其后清掉。
 #ifndef WIN32_LEAN_AND_MEAN
 #	define WIN32_LEAN_AND_MEAN
 #endif
@@ -25,12 +31,14 @@
 #endif
 #include "MagelightUI_API.h"
 
-#include <RE/Skyrim.h>
-#include <SKSE/SKSE.h>
-
-// <Windows.h> 把 GetObject 重定义成 GetObjectW，会盖掉 BGSDefaultObjectManager::GetObject
 #ifdef GetObject
 #	undef GetObject
+#endif
+#ifdef GetObjectA
+#	undef GetObjectA
+#endif
+#ifdef GetObjectW
+#	undef GetObjectW
 #endif
 
 #include <fmt/format.h>
