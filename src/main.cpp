@@ -62,6 +62,7 @@ namespace
 	std::mutex           g_audioLock;
 	std::map<int, Entry> g_playing;
 	int                  g_nextId{ 1 };
+	int                  g_bgm{ 0 };
 
 	RE::BGSSoundCategory* g_musicCategory{ nullptr };
 	float                 g_savedMusicVolume{ 1.0f };
@@ -279,6 +280,7 @@ namespace
 			return;
 		}
 		const std::string* name = static_cast<const std::string*>(a_user);
+		logger::info("收到页面调用 '{}'，参数 '{}'", *name, a_arg ? a_arg : "");
 		std::lock_guard lock(g_callLock);
 		JsCall call;
 		call.name = *name;
@@ -325,6 +327,12 @@ namespace
 		}
 		logger::info("视图已接管 view={}，JS 通道注册 {}/8", view, ok);
 
+		// 直接告诉页面"音频就绪"：页面的 sfx() 只有 audioReady 为真才发，等脚本那句
+		// Magelight.Call(_view,"__audioReady","1") 太被动，这里主动推一次。
+		if (ok > 0) {
+			g_api->InteropCall(view, "__audioReady", "1");
+		}
+
 		// 页面的 'ready' 通常在 UI 模式进入之前就发了，那时通道还不存在，会被宿主丢；
 		// 这里补发一次，让脚本的 OnReady -> PushInfo 把对手名、金币推回页面。
 		if (ok > 0) {
@@ -333,6 +341,72 @@ namespace
 			ready.name = "ready";
 			g_calls.push_back(std::move(ready));
 		}
+	}
+
+	// 只有这四个还需要脚本处理（金币结算 / 信息推送）；音频和关桌由 DLL 自己做完
+	void ForwardToPapyrus(const std::string& a_name, const std::string& a_arg)
+	{
+		auto* source = SKSE::GetModCallbackEventSource();
+		if (!source) {
+			logger::warn("ModCallbackEvent 源拿不到，{} 无法转给脚本", a_name);
+			return;
+		}
+		std::string fullName = "Magelight_JS_" + a_name;
+		const float numArg = static_cast<float>(g_view.load());
+		RE::BSFixedString eventName(fullName.c_str());
+		RE::BSFixedString strArg(a_arg.c_str());
+		SKSE::ModCallbackEvent ev{ eventName, strArg, numArg, nullptr };
+		source->SendEvent(&ev);
+	}
+
+	void StopBgm()
+	{
+		if (g_bgm != 0) {
+			StopClip(g_bgm);
+			g_bgm = 0;
+		}
+	}
+
+	void HandleJsCall(const JsCall& a_call)
+	{
+		const std::string& name = a_call.name;
+
+		if (name == "sfx") {
+			logger::info("页面请求音效 '{}'", a_call.arg);
+			if (!a_call.arg.empty()) {
+				PlayClip(a_call.arg, 1.0f, false);
+			}
+			return;
+		}
+		if (name == "bgm") {
+			logger::info("页面请求 BGM");
+			if (g_bgm == 0) {
+				MusicMuteImpl(true);
+				g_bgm = PlayClip("duel_bgm", 0.85f, true);
+			}
+			return;
+		}
+		if (name == "bgmStop") {
+			logger::info("页面请求停止 BGM");
+			StopBgm();
+			MusicMuteImpl(false);
+			return;
+		}
+		if (name == "duelLeave") {
+			logger::info("页面请求离开牌桌");
+			StopAllClips();
+			g_bgm = 0;
+			MusicMuteImpl(false);
+			const ml::ViewId view = g_view.load();
+			if (g_api && view) {
+				g_api->ShowView(view, false);
+				g_api->ExitUIMode();
+				logger::info("离开牌桌：view={} 已隐藏，UI 模式已释放", view);
+			}
+			return;
+		}
+
+		ForwardToPapyrus(name, a_call.arg);
 	}
 
 	void DrainCalls()
@@ -345,19 +419,8 @@ namespace
 			}
 			local.swap(g_calls);
 		}
-
-		auto* source = SKSE::GetModCallbackEventSource();
-		if (!source) {
-			logger::warn("ModCallbackEvent 源拿不到，页面事件无法转发给脚本");
-			return;
-		}
-
-		const float numArg = static_cast<float>(g_view.load());
 		for (const JsCall& call : local) {
-			RE::BSFixedString eventName(("Magelight_JS_" + call.name).c_str());
-			RE::BSFixedString strArg(call.arg.c_str());
-			SKSE::ModCallbackEvent ev{ eventName, strArg, numArg, nullptr };
-			source->SendEvent(&ev);
+			HandleJsCall(call);
 		}
 	}
 
