@@ -400,9 +400,20 @@ namespace
 			const ml::ViewId view = g_view.load();
 			if (g_api && view) {
 				g_api->ShowView(view, false);
-				g_api->ExitUIMode();
+				/* 必须用 ReleaseUIMode(owner) 正经释放，不能用底层的 ExitUIMode()：
+				   后者只丢掉当前 UI 模式，不会把 mod 的占有状态登记掉，
+				   第二次离开时就会变成空操作（界面关不掉）。 */
+				const ml::ModId owner = g_api->GetUIModeOwner();
+				if (owner) {
+					g_api->ReleaseUIMode(owner);
+				} else {
+					g_api->ExitUIMode();
+				}
 				logger::info("离开牌桌：view={} 已隐藏，UI 模式已释放", view);
 			}
+			/* 同时交回脚本：OnDuelLeave 会 AudioStop、HideBoard、ReleaseUIMode，
+			   把 _round / _bgm 句柄一并复位，避免重入后 BGM 不重启。 */
+			ForwardToPapyrus(name, a_call.arg);
 			return;
 		}
 
