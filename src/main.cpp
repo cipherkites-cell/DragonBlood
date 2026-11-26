@@ -73,6 +73,7 @@ namespace
 
 	const ml::MagelightApi4* g_api{ nullptr };
 	std::atomic<ml::ViewId>  g_view{ 0 };
+	ml::ModId                 g_mod{ 0 };
 
 	struct JsCall
 	{
@@ -288,6 +289,36 @@ namespace
 		g_calls.push_back(std::move(call));
 	}
 
+	// 把自己登记成 "DragonBlood" 这个 mod 的消费者（同名即接管已有 manifest mod）。
+	// ReleaseUIMode 只认属主身份；不注册，后面释放会被拒（Denied），界面关不掉。
+	void EnsureModRegistered()
+	{
+		if (g_mod) {
+			return;
+		}
+		ml::ModDesc desc{};
+		desc.size = sizeof(desc);
+		desc.modId = "DragonBlood";
+		desc.displayName = "DragonBlood";
+		desc.modVersion = 0x010000;
+		desc.minHostVersion = 0;
+		desc.callbackThread = ml::CallbackThread::GameThread;
+		desc.onEvent = nullptr;
+		desc.onLog = nullptr;
+		desc.user = nullptr;
+		desc.sessionName = nullptr;
+
+		ml::ModId id = 0;
+		const ml::Result r = g_api->RegisterMod(&desc, &id);
+		if (r == ml::Result::Ok && id) {
+			g_mod = id;
+			logger::info("已接管 mod DragonBlood，ModId={}", id);
+		} else {
+			logger::warn("RegisterMod 返回 {}，ModId={}（释放 UI 模式可能被拒）",
+				static_cast<std::int32_t>(r), id);
+		}
+	}
+
 	void AttachViewIfPossible()
 	{
 		if (!g_api) {
@@ -297,6 +328,7 @@ namespace
 			}
 			logger::info("Magelight UI API v4 已取到（host {}）", g_api->hostVersion ? g_api->hostVersion : "?");
 		}
+		EnsureModRegistered();
 
 		const ml::ModId owner = g_api->GetUIModeOwner();
 		if (!owner) {
@@ -403,16 +435,21 @@ namespace
 				/* 必须用 ReleaseUIMode(owner) 正经释放，不能用底层的 ExitUIMode()：
 				   后者只丢掉当前 UI 模式，不会把 mod 的占有状态登记掉，
 				   第二次离开时就会变成空操作（界面关不掉）。 */
-				const ml::ModId owner = g_api->GetUIModeOwner();
+				const ml::ModId owner = g_mod ? g_mod : g_api->GetUIModeOwner();
+				const bool activeBefore = g_api->IsUIModeActive() != 0;
+				ml::Result rel = ml::Result::Unsupported;
 				if (owner) {
-					g_api->ReleaseUIMode(owner);
+					rel = g_api->ReleaseUIMode(owner);
 				} else {
 					g_api->ExitUIMode();
 				}
-				logger::info("离开牌桌：view={} 已隐藏，UI 模式已释放", view);
+				const bool activeAfter = g_api->IsUIModeActive() != 0;
+				logger::info("离开牌桌：view={} mod={} 释放结果={}（0=Ok 9=Denied），关前 active={} 关后 active={}",
+					view, owner, static_cast<std::int32_t>(rel), activeBefore ? 1 : 0, activeAfter ? 1 : 0);
 			}
 			/* 同时交回脚本：OnDuelLeave 会 AudioStop、HideBoard、ReleaseUIMode，
 			   把 _round / _bgm 句柄一并复位，避免重入后 BGM 不重启。 */
+			logger::info("离开牌桌：转发 ModEvent Magelight_JS_duelLeave");
 			ForwardToPapyrus(name, a_call.arg);
 			return;
 		}
@@ -537,6 +574,6 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	}
 
 	StartWorker();
-	logger::info("DragonBlood 载入：后台线程已启动（视图通道与音频循环异步接管）");
+	logger::info("DragonBlood 载入：后台线程已启动（视图通道与音频循环异步接管）  [build=closefix-r2]");
 	return true;
 }
