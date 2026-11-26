@@ -1,16 +1,18 @@
-// DragonBlood.dll — 只做音频（页面 Ultralight 没有媒体栈，Papyrus 也没有按文件播放、
+// DragonBlood.dll — 音频 + 关桌兜底（页面 Ultralight 没有媒体栈，Papyrus 也没有按文件播放、
 // 改「Music」类别音量的接口）。
 //
-// 通道划分（与 Papyrus 持久脚本 DragonBlood_DuelQuest 错开，避免抢占同一个监听槽）：
-//   · DLL 只注册音频通道：sfx / bgm / bgmStop，回调里直接在本插件内播放。
-//   · ready / duelWin / duelLose / duelDraw / duelLeave 由持久任务脚本自己
-//     Magelight.RegisterListener，ModEvent 直接进脚本，DLL 不再转发。
+// 通道划分（Magelight 的监听槽按名字只存一份，后注册者覆盖先注册者）：
+//   · DLL 注册：sfx / bgm / bgmStop / duelLeave，回调直接在本插件内播放与关桌。
+//   · ready / duelWin / duelLose / duelDraw 仍由主片段脚本自己 RegisterListener，
+//     这三个结算通道 DLL 不碰，避免覆盖脚本的结算监听。
 //
-// 关键约束（读 Magelight 源码确认）：
+// 关键约束（读 Magelight 0cbe86 源码确认）：
 //   · 绝不在本 DLL 里 RegisterMod 接管 "DragonBlood"：接管后该 mod 变成 plugin-owned，
 //     Papyrus 对它的 RequestUIMode / ReleaseUIMode / ShowView 全部静默失效或被拒，
 //     第二次进桌会报 "UI mode refused"，关桌也退不掉。
-//   · UI 模式的进入 / 释放归属主脚本管；DLL 只做跨视图可寻址的监听注册与音频播放。
+//   · 关桌释放不按硬编码 mod id，而是取运行时 GetUIModeOwner() 的真实属主再
+//     ReleaseUIMode(owner)；宿主校验只比对 s_uiOwner == mod，ABI 不带调用者身份，
+//     插件以他人属主身份释放不要求自己是属主。
 //   · Magelight.dll 比本插件后加载，API 不能在加载阶段取，必须运行中惰性查找。
 
 #include <RE/Skyrim.h>
@@ -228,6 +230,19 @@ namespace
 		g_playing.clear();
 	}
 
+	// 按文件名查是否已有同一条循环音在播：首进牌桌时 Papyrus StartAudio 已经起过
+	// 一条 duel_bgm，页面再发 bgm 不能重复叠第二条。
+	bool HasLoopingClip(const std::string& a_file)
+	{
+		std::lock_guard lock(g_audioLock);
+		for (const auto& pair : g_playing) {
+			if (pair.second.loop && pair.second.file.find(a_file) != std::string::npos) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	void TickOnce()
 	{
 		std::lock_guard lock(g_audioLock);
@@ -308,20 +323,20 @@ namespace
 			return;
 		}
 
-		// 只注册音频通道；ready / duelWin / duelLose / duelDraw / duelLeave 留给持久任务脚本。
+		// 音频通道 + duelLeave 关桌兜底；ready / duelWin / duelLose / duelDraw 留给主片段脚本。
 		// 宿主的监听槽按名字存一份，后注册者覆盖先注册者，两档不能抢同一个名字。
-		static std::string s_names[3];
-		static const char* const kChannels[3] = { "sfx", "bgm", "bgmStop" };
+		static std::string s_names[4];
+		static const char* const kChannels[4] = { "sfx", "bgm", "bgmStop", "duelLeave" };
 
 		g_view.store(view);
 		int ok = 0;
-		for (int i = 0; i < 3; ++i) {
+		for (int i = 0; i < 4; ++i) {
 			s_names[i] = kChannels[i];
 			if (g_api->RegisterJSListenerEx(view, kChannels[i], OnJsCall, &s_names[i]) == ml::Result::Ok) {
 				++ok;
 			}
 		}
-		logger::info("视图已接管 view={}，音频通道注册 {}/3", view, ok);
+		logger::info("视图已接管 view={}，通道注册 {}/4", view, ok);
 
 		// 直接告诉页面"音频就绪"：页面的 sfx() 只有 audioReady 为真才发。
 		if (ok > 0) {
@@ -350,7 +365,7 @@ namespace
 		}
 		if (name == "bgm") {
 			logger::info("页面请求 BGM");
-			if (g_bgm == 0) {
+			if (g_bgm == 0 && !HasLoopingClip("duel_bgm.wav")) {
 				MusicMuteImpl(true);
 				g_bgm = PlayClip("duel_bgm", 0.85f, true);
 			}
@@ -362,8 +377,28 @@ namespace
 			MusicMuteImpl(false);
 			return;
 		}
+		if (name == "duelLeave") {
+			logger::info("页面请求离开牌桌");
+			StopAllClips();
+			g_bgm = 0;
+			MusicMuteImpl(false);
 
-		// 其余通道（ready / duelWin / duelLose / duelDraw / duelLeave）由持久任务脚本自己监听。
+			const ml::ViewId view = g_view.load();
+			const ml::ModId owner = g_api->GetUIModeOwner();
+			if (owner == 0) {
+				logger::warn("离开牌桌：当前没有 UI 模式属主，无法释放模式");
+			} else {
+				const ml::Result res = g_api->ReleaseUIMode(owner);
+				logger::info("离开牌桌：属主 mod={}，ReleaseUIMode 结果={}",
+					static_cast<unsigned>(owner), static_cast<int>(res));
+			}
+			if (view && g_api->IsViewValid(view)) {
+				g_api->ShowView(view, false);
+			}
+			return;
+		}
+
+		// ready / duelWin / duelLose / duelDraw 仍由主片段脚本自己监听结算。
 	}
 
 	void DrainCalls()
@@ -501,6 +536,6 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	}
 
 	StartWorker();
-	logger::info("DragonBlood 载入：后台线程已启动（仅音频通道，UI 归属主脚本）  [build=closefix-r3]");
+	logger::info("DragonBlood 载入：后台线程已启动（音频 + duelLeave 关桌兜底，无 mod 接管）  [build=closefix-r4]");
 	return true;
 }
