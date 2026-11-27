@@ -72,6 +72,7 @@ namespace
 	const ml::MagelightApi4* g_api{ nullptr };
 	std::atomic<ml::ViewId>  g_view{ 0 };
 	std::atomic<bool>        g_wasActive{ false };
+	std::atomic<bool>        g_attachPending{ true };   // 每次进 UI 模式都要重注册通道（页面会重载）
 
 	struct JsCall
 	{
@@ -319,7 +320,12 @@ namespace
 		if (g_api->FindView(owner, "board", &view) != ml::Result::Ok || !view) {
 			return;
 		}
-		if (view == g_view.load()) {
+
+		// manifest 里 loadOnShow=true：每次显示视图都会重载页面，DOM 是新的，宿主要重新下发
+		// 一次通道 shim 页面才连得上。所以不能在"视图 id 没变"时提前返回——否则第二次进桌
+		// 一次都不重注册，页面的 sfx/bgm/duelLeave 全部落空（无音效、无 BGM、关不掉桌）。
+		// 只在 mode 从关到开的边沿重注册一次，不是每帧都做。
+		if (!g_attachPending.exchange(false)) {
 			return;
 		}
 
@@ -337,6 +343,11 @@ namespace
 			}
 		}
 		logger::info("视图已接管 view={}，通道注册 {}/4", view, ok);
+		if (ok == 0) {
+			// 视图还没就绪（重建中）：把标记放回去，下一跳再试，不能就这么丢掉一次进桌。
+			g_attachPending.store(true);
+			return;
+		}
 
 		// 直接告诉页面"音频就绪"：页面的 sfx() 只有 audioReady 为真才发。
 		if (ok > 0) {
@@ -428,7 +439,13 @@ namespace
 			StopAllClips();
 			g_bgm = 0;
 			MusicMuteImpl(false);
+			g_view.store(0);
 			logger::info("UI 模式已退出：音频已复位");
+		}
+		if (!g_wasActive.load() && active) {
+			// 新的一次进桌：页面会重新加载，通道要重注册一遍。
+			g_attachPending.store(true);
+			logger::info("UI 模式已进入：准备重注册页面通道");
 		}
 		g_wasActive.store(active);
 	}
@@ -436,9 +453,11 @@ namespace
 	// 游戏线程
 	void Pump()
 	{
+		// 先判边沿再挂通道：同一 tick 里进入模式就能注册上，不等下一个 250ms 心跳，
+		// 免得页面刚显示时那一声 sfx('/ready') 落在空窗里。
+		WatchUiMode();
 		AttachViewIfPossible();
 		DrainCalls();
-		WatchUiMode();
 		TickOnce();
 	}
 
@@ -536,6 +555,6 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	}
 
 	StartWorker();
-	logger::info("DragonBlood 载入：后台线程已启动（音频 + duelLeave 关桌兜底，无 mod 接管）  [build=closefix-r4]");
+	logger::info("DragonBlood 载入：后台线程已启动（音频 + duelLeave 关桌兜底，无 mod 接管）  [build=closefix-r5]");
 	return true;
 }
