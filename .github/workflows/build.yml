@@ -1,8 +1,12 @@
 name: build
 
-# 只在 Actions 页面手动点 "Run workflow" 时运行：提交代码不会自动打包
+# 默认只在 Actions 页面手动点 "Run workflow" 时跑；push 也会触发，按需删掉 push 那段即可
 on:
   workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
 
 permissions:
   contents: read
@@ -12,31 +16,30 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # SkyrimYacht 上验证过的同一套组合
+  # 与已验证组合对齐：固定 vcpkg 与 CommonLibSSE-NG 提交，避免依赖漂移
   VCPKG_COMMIT: 9e593bb18ea69cc5095e012465dcd675a822ed0d
-  # alandtse/CommonLibSSE-NG 的 ng 分支（含 GetSoundHandleByFile），固定提交避免漂移
   CLIB_COMMIT: 7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a
-  # MagelightUI_API.h 的来源（固定提交，避免头文件漂移）
-  MAGELIGHT_COMMIT: 0cbe86afc68155e6fddc964e38e0f6faf08c3427
   VCPKG_ROOT: ${{ github.workspace }}\vcpkg
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
   VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
 
 jobs:
   windows:
+    # 必须用 2022：2025/latest 已换成 VS 18，CMake 不认识 "Visual Studio 17 2022"
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: 取回 MagelightUI_API.h（Magelight 的公开头文件，不放进仓库）
+      - name: 拉取 Dear ImGui（1.91.8，插件用单参 PushFont，1.92 会编译失败）
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Severause/MagelightUI/$env:MAGELIGHT_COMMIT/api/MagelightUI_API.h" -OutFile "src\MagelightUI_API.h"
-          if (-not (Test-Path "src\MagelightUI_API.h")) { throw "MagelightUI_API.h 下载失败" }
+          New-Item -ItemType Directory -Force -Path "extern\deps-src" | Out-Null
+          git clone --depth 1 --branch v1.91.8 https://github.com/ocornut/imgui extern/deps-src/imgui
+          if ($LASTEXITCODE -ne 0) { throw "imgui clone 失败" }
 
-      - name: 取回 CommonLibSSE-NG 源码
+      - name: 拉取 CommonLibSSE-NG
         shell: pwsh
         run: |
           git clone --recursive https://github.com/alandtse/CommonLibSSE-NG extern/CommonLibSSE-NG
@@ -56,8 +59,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg_installed
-          key: vcpkg-inst-${{ runner.os }}-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-inst-${{ runner.os }}-x64-windows-static-md-
+          key: vcpkg-inst-${{ runner.os }}-${{ env.VCPKG_DEFAULT_TRIPLET }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-inst-${{ runner.os }}-${{ env.VCPKG_DEFAULT_TRIPLET }}-
 
       - name: 准备 vcpkg
         shell: pwsh
@@ -70,7 +73,12 @@ jobs:
           & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap 失败" }
           & "$env:VCPKG_ROOT/vcpkg.exe" version
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg 无法运行" }
+
+      - name: 安装依赖（manifest 模式）
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet x64-windows-static-md --x-install-root="$env:GITHUB_WORKSPACE/vcpkg_installed"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install 失败" }
 
       - name: Configure
         id: configure
@@ -82,7 +90,8 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake",
             "-DVCPKG_TARGET_TRIPLET=x64-windows-static-md",
             "-DVCPKG_INSTALLED_DIR=$env:GITHUB_WORKSPACE/vcpkg_installed",
-            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>DLL",
+            "-DSUITE_ROOT=$($env:GITHUB_WORKSPACE -replace '\\','/')"
           )
           $generators = @("Visual Studio 17 2022")
           $help = (cmake --help) -join "`n"
@@ -95,7 +104,7 @@ jobs:
             Remove-Item -LiteralPath build -Recurse -Force -ErrorAction SilentlyContinue
           }
           if (-not $ok) {
-            Select-String -Path logs/configure.txt -Pattern 'error|Error|CMake Error' | Select-Object -First 40 |
+            Select-String -Path logs/configure.txt -Pattern 'error|CMake Error' | Select-Object -First 40 |
               ForEach-Object { Write-Output "::error::$($_.Line.Trim())" }
             exit 1
           }
@@ -116,7 +125,7 @@ jobs:
         if: steps.configure.outcome != 'success' || steps.build.outcome != 'success'
         shell: pwsh
         run: |
-          Get-ChildItem logs -ErrorAction SilentlyContinue | ForEach-Object { "---- $($_.Name)"; Get-Content $_.FullName -Tail 60 }
+          Get-ChildItem logs -ErrorAction SilentlyContinue | ForEach-Object { "---- $($_.Name)"; Get-Content $_.FullName -Tail 80 }
           exit 1
 
       - name: 上传日志
@@ -127,10 +136,10 @@ jobs:
           path: logs/
           if-no-files-found: warn
 
-      - name: 上传 DLL
+      - name: 上传 DLL 与语言文件
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: DragonBlood
-          path: build/Release/DragonBlood.dll
+          name: TamrielBestiary-zh_CN
+          path: dist/Data/
           if-no-files-found: error
